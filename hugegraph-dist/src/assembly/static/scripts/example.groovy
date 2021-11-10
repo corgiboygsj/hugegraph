@@ -1,5 +1,5 @@
-import com.baidu.hugegraph.HugeFactory
-import com.baidu.hugegraph.dist.RegisterUtil
+import org.baidu.hugegraph.HugeFactory
+import org.baidu.hugegraph.dist.RegisterUtil
 import org.apache.tinkerpop.gremlin.structure.T
 
 RegisterUtil.registerCassandra();

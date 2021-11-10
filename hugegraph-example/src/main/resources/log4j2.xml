@@ -105,7 +105,7 @@
             <appender-ref ref="console"/>
             <appender-ref ref="audit"/>
         </AsyncLogger>
-        <AsyncLogger name="com.baidu.hugegraph.api.filter.AuthenticationFilter" level="INFO" additivity="false">
+        <AsyncLogger name="org.apache.hugegraph.api.filter.AuthenticationFilter" level="INFO" additivity="false">
             <appender-ref ref="console"/>
             <appender-ref ref="audit"/>
         </AsyncLogger>
