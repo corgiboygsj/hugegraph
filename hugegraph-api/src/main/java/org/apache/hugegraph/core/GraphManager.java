@@ -1,0 +1,367 @@
+/*
+ * Copyright 2017 HugeGraph Authors
+ *
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with this
+ * work for additional information regarding copyright ownership. The ASF
+ * licenses this file to You under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.hugegraph.core;
+
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.tinkerpop.gremlin.server.auth.AuthenticationException;
+import org.apache.tinkerpop.gremlin.server.util.MetricManager;
+import org.apache.tinkerpop.gremlin.structure.Graph;
+import org.apache.tinkerpop.gremlin.structure.Transaction;
+import org.apache.tinkerpop.gremlin.structure.util.GraphFactory;
+import org.apache.hugegraph.auth.HugeAuthenticator;
+import org.apache.hugegraph.auth.HugeFactoryAuthProxy;
+import org.apache.hugegraph.auth.HugeGraphAuthProxy;
+import org.apache.hugegraph.backend.cache.Cache;
+import org.apache.hugegraph.backend.cache.CacheManager;
+import org.apache.hugegraph.backend.id.IdGenerator;
+import org.apache.hugegraph.backend.store.BackendStoreSystemInfo;
+import org.apache.hugegraph.exception.NotSupportException;
+import org.apache.hugegraph.type.define.NodeRole;
+import org.slf4j.Logger;
+
+import org.apache.hugegraph.HugeFactory;
+import org.apache.hugegraph.HugeGraph;
+import org.apache.hugegraph.auth.AuthManager;
+import org.apache.hugegraph.backend.BackendException;
+
+import com.baidu.hugegraph.config.HugeConfig;
+import org.apache.hugegraph.config.ServerOptions;
+import org.apache.hugegraph.license.LicenseVerifier;
+import org.apache.hugegraph.metrics.MetricsUtil;
+import org.apache.hugegraph.metrics.ServerReporter;
+import com.baidu.hugegraph.rpc.RpcClientProvider;
+import com.baidu.hugegraph.rpc.RpcConsumerConfig;
+import com.baidu.hugegraph.rpc.RpcProviderConfig;
+import com.baidu.hugegraph.rpc.RpcServer;
+import org.apache.hugegraph.serializer.JsonSerializer;
+import org.apache.hugegraph.serializer.Serializer;
+import org.apache.hugegraph.server.RestServer;
+import org.apache.hugegraph.task.TaskManager;
+
+import com.baidu.hugegraph.util.E;
+import com.baidu.hugegraph.util.Log;
+
+public final class GraphManager {
+
+    private static final Logger LOG = Log.logger(RestServer.class);
+
+    private final Map<String, Graph> graphs;
+    private final HugeAuthenticator authenticator;
+    private final RpcServer rpcServer;
+    private final RpcClientProvider rpcClient;
+
+    public GraphManager(HugeConfig conf) {
+        this.graphs = new ConcurrentHashMap<>();
+        this.authenticator = HugeAuthenticator.loadAuthenticator(conf);
+        this.rpcServer = new RpcServer(conf);
+        this.rpcClient = new RpcClientProvider(conf);
+
+        this.loadGraphs(conf.getMap(ServerOptions.GRAPHS));
+        // this.installLicense(conf, "");
+        // Raft will load snapshot firstly then launch election and replay log
+        this.waitGraphsStarted();
+        this.checkBackendVersionOrExit(conf);
+        this.startRpcServer();
+        this.serverStarted(conf);
+        this.addMetrics(conf);
+    }
+
+    public void loadGraphs(final Map<String, String> graphConfs) {
+        for (Map.Entry<String, String> conf : graphConfs.entrySet()) {
+            String name = conf.getKey();
+            String path = conf.getValue();
+            HugeFactory.checkGraphName(name, "rest-server.properties");
+            try {
+                this.loadGraph(name, path);
+            } catch (RuntimeException e) {
+                LOG.error("Graph '{}' can't be loaded: '{}'", name, path, e);
+            }
+        }
+    }
+
+    public void waitGraphsStarted() {
+        this.graphs.keySet().forEach(name -> {
+            HugeGraph graph = this.graph(name);
+            graph.waitStarted();
+        });
+    }
+
+    public Set<String> graphs() {
+        return Collections.unmodifiableSet(this.graphs.keySet());
+    }
+
+    public HugeGraph graph(String name) {
+        Graph graph = this.graphs.get(name);
+        if (graph == null) {
+            return null;
+        } else if (graph instanceof HugeGraph) {
+            return (HugeGraph) graph;
+        }
+        throw new NotSupportException("graph instance of %s", graph.getClass());
+    }
+
+    public Serializer serializer(Graph g) {
+        return JsonSerializer.instance();
+    }
+
+    public void rollbackAll() {
+        this.graphs.values().forEach(graph -> {
+            if (graph.features().graph().supportsTransactions() &&
+                graph.tx().isOpen()) {
+                graph.tx().rollback();
+            }
+        });
+    }
+
+    public void rollback(final Set<String> graphSourceNamesToCloseTxOn) {
+        closeTx(graphSourceNamesToCloseTxOn, Transaction.Status.ROLLBACK);
+    }
+
+    public void commitAll() {
+        this.graphs.values().forEach(graph -> {
+            if (graph.features().graph().supportsTransactions() &&
+                graph.tx().isOpen()) {
+                graph.tx().commit();
+            }
+        });
+    }
+
+    public void commit(final Set<String> graphSourceNamesToCloseTxOn) {
+        closeTx(graphSourceNamesToCloseTxOn, Transaction.Status.COMMIT);
+    }
+
+    public boolean requireAuthentication() {
+        if (this.authenticator == null) {
+            return false;
+        }
+        return this.authenticator.requireAuthentication();
+    }
+
+    public HugeAuthenticator.User authenticate(Map<String, String> credentials)
+                                               throws AuthenticationException {
+        return this.authenticator().authenticate(credentials);
+    }
+
+    public AuthManager authManager() {
+        return this.authenticator().authManager();
+    }
+
+    public void close() {
+        this.destroyRpcServer();
+    }
+
+    private void startRpcServer() {
+        if (!this.rpcServer.enabled()) {
+            LOG.info("RpcServer is not enabled, skip starting rpc service");
+            return;
+        }
+
+        RpcProviderConfig serverConfig = this.rpcServer.config();
+
+        // Start auth rpc service if authenticator enabled
+        if (this.authenticator != null) {
+            serverConfig.addService(AuthManager.class,
+                                    this.authenticator.authManager());
+        }
+
+        // Start graph rpc service if RPC_REMOTE_URL enabled
+        if (this.rpcClient.enabled()) {
+            RpcConsumerConfig clientConfig = this.rpcClient.config();
+
+            for (Graph graph : this.graphs.values()) {
+                HugeGraph hugegraph = (HugeGraph) graph;
+                hugegraph.registerRpcServices(serverConfig, clientConfig);
+            }
+        }
+
+        try {
+            this.rpcServer.exportAll();
+        } catch (Throwable e) {
+            this.rpcServer.destroy();
+            throw e;
+        }
+    }
+
+    private void destroyRpcServer() {
+        try {
+            this.rpcClient.destroy();
+        } finally {
+            this.rpcServer.destroy();
+        }
+    }
+
+    private HugeAuthenticator authenticator() {
+        E.checkState(this.authenticator != null, "Unconfigured authenticator");
+        return this.authenticator;
+    }
+
+    @SuppressWarnings("unused")
+    private void installLicense(HugeConfig config, String md5) {
+        LicenseVerifier.instance().install(config, this, md5);
+    }
+
+    private void closeTx(final Set<String> graphSourceNamesToCloseTxOn,
+                         final Transaction.Status tx) {
+        final Set<Graph> graphsToCloseTxOn = new HashSet<>();
+
+        graphSourceNamesToCloseTxOn.forEach(name -> {
+            if (this.graphs.containsKey(name)) {
+                graphsToCloseTxOn.add(this.graphs.get(name));
+            }
+        });
+
+        graphsToCloseTxOn.forEach(graph -> {
+            if (graph.features().graph().supportsTransactions() &&
+                graph.tx().isOpen()) {
+                if (tx == Transaction.Status.COMMIT) {
+                    graph.tx().commit();
+                } else {
+                    graph.tx().rollback();
+                }
+            }
+        });
+    }
+
+    private void loadGraph(String name, String path) {
+        final Graph graph = GraphFactory.open(path);
+        this.graphs.put(name, graph);
+        LOG.info("Graph '{}' was successfully configured via '{}'", name, path);
+
+        if (this.requireAuthentication() &&
+            !(graph instanceof HugeGraphAuthProxy)) {
+            LOG.warn("You may need to support access control for '{}' with {}",
+                     path, HugeFactoryAuthProxy.GRAPH_FACTORY);
+        }
+    }
+
+    private void checkBackendVersionOrExit(HugeConfig config) {
+        for (String graph : this.graphs()) {
+            // TODO: close tx from main thread
+            HugeGraph hugegraph = this.graph(graph);
+            if (!hugegraph.backendStoreFeatures().supportsPersistence()) {
+                hugegraph.initBackend();
+                if (this.requireAuthentication()) {
+                    String token = config.get(ServerOptions.AUTH_ADMIN_TOKEN);
+                    try {
+                        this.authenticator.initAdminUser(token);
+                    } catch (Exception e) {
+                        throw new BackendException(
+                                  "The backend store of '%s' can't " +
+                                  "initialize admin user", hugegraph.name());
+                    }
+                }
+            }
+            BackendStoreSystemInfo info = hugegraph.backendStoreSystemInfo();
+            if (!info.exists()) {
+                throw new BackendException(
+                          "The backend store of '%s' has not been initialized",
+                          hugegraph.name());
+            }
+            if (!info.checkVersion()) {
+                throw new BackendException(
+                          "The backend store version is inconsistent");
+            }
+        }
+    }
+
+    private void serverStarted(HugeConfig config) {
+        String server = config.get(ServerOptions.SERVER_ID);
+        String role = config.get(ServerOptions.SERVER_ROLE);
+        E.checkArgument(server != null && !server.isEmpty(),
+                        "The server name can't be null or empty");
+        E.checkArgument(role != null && !role.isEmpty(),
+                        "The server role can't be null or empty");
+        NodeRole nodeRole = NodeRole.valueOf(role.toUpperCase());
+        for (String graph : this.graphs()) {
+            HugeGraph hugegraph = this.graph(graph);
+            assert hugegraph != null;
+            hugegraph.serverStarted(IdGenerator.of(server), nodeRole);
+        }
+    }
+
+    private void addMetrics(HugeConfig config) {
+        final MetricManager metric = MetricManager.INSTANCE;
+        // Force to add server reporter
+        ServerReporter reporter = ServerReporter.instance(metric.getRegistry());
+        reporter.start(60L, TimeUnit.SECONDS);
+
+        // Add metrics for MAX_WRITE_THREADS
+        int maxWriteThreads = config.get(ServerOptions.MAX_WRITE_THREADS);
+        MetricsUtil.registerGauge(RestServer.class, "max-write-threads", () -> {
+            return maxWriteThreads;
+        });
+
+        // Add metrics for caches
+        @SuppressWarnings({ "rawtypes", "unchecked" })
+        Map<String, Cache<?, ?>> caches = (Map) CacheManager.instance()
+                                                            .caches();
+        registerCacheMetrics(caches);
+        final AtomicInteger lastCachesSize = new AtomicInteger(caches.size());
+        MetricsUtil.registerGauge(Cache.class, "instances", () -> {
+            int count = caches.size();
+            if (count != lastCachesSize.get()) {
+                // Update if caches changed (effect in the next report period)
+                registerCacheMetrics(caches);
+                lastCachesSize.set(count);
+            }
+            return count;
+        });
+
+        // Add metrics for task
+        MetricsUtil.registerGauge(TaskManager.class, "workers", () -> {
+            return TaskManager.instance().workerPoolSize();
+        });
+        MetricsUtil.registerGauge(TaskManager.class, "pending-tasks", () -> {
+            return TaskManager.instance().pendingTasks();
+        });
+    }
+
+    private static void registerCacheMetrics(Map<String, Cache<?, ?>> caches) {
+        Set<String> names = MetricManager.INSTANCE.getRegistry().getNames();
+        for (Map.Entry<String, Cache<?, ?>> entry : caches.entrySet()) {
+            String key = entry.getKey();
+            Cache<?, ?> cache = entry.getValue();
+
+            String hits = String.format("%s.%s", key, "hits");
+            String miss = String.format("%s.%s", key, "miss");
+            String exp = String.format("%s.%s", key, "expire");
+            String size = String.format("%s.%s", key, "size");
+            String cap = String.format("%s.%s", key, "capacity");
+
+            // Avoid registering multiple times
+            if (names.stream().anyMatch(name -> name.endsWith(hits))) {
+                continue;
+            }
+
+            MetricsUtil.registerGauge(Cache.class, hits, () -> cache.hits());
+            MetricsUtil.registerGauge(Cache.class, miss, () -> cache.miss());
+            MetricsUtil.registerGauge(Cache.class, exp, () -> cache.expire());
+            MetricsUtil.registerGauge(Cache.class, size, () -> cache.size());
+            MetricsUtil.registerGauge(Cache.class, cap, () -> cache.capacity());
+        }
+    }
+}
